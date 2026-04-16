@@ -23,11 +23,13 @@ import io
 import logging
 import os
 import re
+import sys
 import time
 from datetime import date, timedelta
 
 import pdfplumber
 import requests
+from postgrest.exceptions import APIError
 from supabase import create_client, Client
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,6 +72,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+class FatalConfigError(RuntimeError):
+    """Non-retryable setup/configuration error."""
+
+
+def _is_missing_table_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return "PGRST205" in msg and TABLE_NAME in msg
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Supabase helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,13 +91,22 @@ def get_supabase() -> Client:
 
 def get_last_stored_date(sb: Client) -> date | None:
     """Return the most recent trade_date stored, or None."""
-    res = (
-        sb.table(TABLE_NAME)
-        .select("trade_date")
-        .order("trade_date", desc=True)
-        .limit(1)
-        .execute()
-    )
+    try:
+        res = (
+            sb.table(TABLE_NAME)
+            .select("trade_date")
+            .order("trade_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except APIError as exc:
+        if _is_missing_table_error(exc):
+            raise FatalConfigError(
+                f"Supabase table '{TABLE_NAME}' was not found. "
+                "Run supabaseschema.sql in your Supabase SQL Editor, then retry."
+            ) from exc
+        raise
+
     if res.data:
         return date.fromisoformat(res.data[0]["trade_date"])
     return None
@@ -95,7 +115,16 @@ def get_last_stored_date(sb: Client) -> date | None:
 def upsert_rows(sb: Client, rows: list[dict]) -> None:
     if not rows:
         return
-    sb.table(TABLE_NAME).upsert(rows, on_conflict="ticker,trade_date").execute()
+    try:
+        sb.table(TABLE_NAME).upsert(rows, on_conflict="ticker,trade_date").execute()
+    except APIError as exc:
+        if _is_missing_table_error(exc):
+            raise FatalConfigError(
+                f"Supabase table '{TABLE_NAME}' was not found. "
+                "Run supabaseschema.sql in your Supabase SQL Editor, then retry."
+            ) from exc
+        raise
+
     log.info("    Upserted %d rows", len(rows))
 
 
@@ -291,4 +320,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except FatalConfigError as exc:
+        log.error("%s", exc)
+        sys.exit(2)
