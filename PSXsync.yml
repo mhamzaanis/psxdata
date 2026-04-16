@@ -1,0 +1,3 @@
+# Legacy reference file only.
+# Active GitHub Actions workflow lives at:
+#   .github/workflows/psx-sync.yml

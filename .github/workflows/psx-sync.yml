@@ -1,0 +1,81 @@
+name: PSX Daily Price Sync
+
+on:
+  schedule:
+    # High-frequency publish window (PKT afternoon/evening)
+    - cron: "*/20 9-14 * * 1-5"
+    # Ongoing catch-up cadence for historical backfill
+    - cron: "15 */2 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Initial backfill date (YYYY-MM-DD)"
+        required: false
+        default: "2015-01-01"
+      max_days_per_run:
+        description: "Max calendar days to process per run (0 = no cap)"
+        required: false
+        default: "300"
+
+concurrency:
+  group: psx-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fetch and Parse PSX PDFs to Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      START_DATE: ${{ inputs.start_date || '2015-01-01' }}
+      MAX_DAYS_PER_RUN: ${{ inputs.max_days_per_run || '300' }}
+      MAX_RETRIES: "4"
+      RETRY_DELAY: "6"
+      REQUEST_DELAY: "0.8"
+      BATCH_SIZE: "300"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          test -n "$SUPABASE_URL" || (echo "SUPABASE_URL is missing" && exit 1)
+          test -n "$SUPABASE_SERVICE_KEY" || (echo "SUPABASE_SERVICE_KEY is missing" && exit 1)
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PSX sync with retries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "Run attempt $attempt/3"
+            if python fetch.py; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Retrying in 30s..."
+              sleep 30
+            fi
+          done
+          echo "PSX sync failed after 3 attempts"
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "::error::PSX sync failed. Review workflow logs for details."
