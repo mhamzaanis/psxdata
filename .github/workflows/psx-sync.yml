@@ -30,8 +30,9 @@ jobs:
       contents: read
 
     env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # Fallbacks handle common naming mismatches in repository settings.
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL || secrets.SUPABASE_UR || vars.SUPABASE_URL || vars.SUPABASE_UR }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY || secrets.SUPABASE_SERVIVE_KEY || vars.SUPABASE_SERVICE_KEY || vars.SUPABASE_SERVIVE_KEY }}
       START_DATE: ${{ inputs.start_date || '2015-01-01' }}
       MAX_DAYS_PER_RUN: ${{ inputs.max_days_per_run || '300' }}
       MAX_RETRIES: "4"
