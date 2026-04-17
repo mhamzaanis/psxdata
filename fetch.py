@@ -43,7 +43,7 @@ SUPABASE_URL: str         = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY: str = os.environ["SUPABASE_SERVICE_KEY"]
 
 TABLE_NAME    = "datatable"
-START_DATE    = date.fromisoformat(os.getenv("START_DATE", "2015-01-01"))
+START_DATE    = date.fromisoformat(os.getenv("START_DATE", "2018-01-01"))
 
 MAX_RETRIES      = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY      = float(os.getenv("RETRY_DELAY", "10"))
