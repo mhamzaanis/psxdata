@@ -42,8 +42,9 @@ from supabase import create_client, Client
 SUPABASE_URL: str         = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY: str = os.environ["SUPABASE_SERVICE_KEY"]
 
-TABLE_NAME    = "datatable"
-START_DATE    = date.fromisoformat(os.getenv("START_DATE", "2018-01-01"))
+TABLE_NAME         = "datatable"
+SUMMARY_TABLE_NAME = "market_daily_summary"
+START_DATE         = date.fromisoformat(os.getenv("START_DATE", "2018-01-01"))
 
 MAX_RETRIES      = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY      = float(os.getenv("RETRY_DELAY", "10"))
@@ -61,14 +62,12 @@ PDF_URL_TEMPLATES = [
     if t.strip()
 ]
 
-# Fail the run if no rows are stored; this prevents silent "successful" no-op runs.
+# Fail the run if no rows are stored; prevents silent no-op runs.
 FAIL_ON_EMPTY_RUN = os.getenv("FAIL_ON_EMPTY_RUN", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
+    "0", "false", "no",
 }
 
-# Sections to skip entirely
+# Sections to skip entirely (futures, bonds, defaulters)
 SKIP_SECTION_KEYWORDS = {
     "FUTURE CONTRACTS",
     "STOCK INDEX FUTURE",
@@ -94,7 +93,7 @@ class FatalConfigError(RuntimeError):
 
 def _is_missing_table_error(exc: Exception) -> bool:
     msg = str(exc)
-    return "PGRST205" in msg and TABLE_NAME in msg
+    return "PGRST205" in msg and (TABLE_NAME in msg or SUMMARY_TABLE_NAME in msg)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -106,50 +105,57 @@ def get_supabase() -> Client:
 
 
 def get_last_stored_date(sb: Client) -> date | None:
-    """Return the most recent trade date stored, or None."""
+    """Return the most recent trade_date stored in market_daily_summary, or None."""
     try:
         res = (
-            sb.table(TABLE_NAME)
-            .select("date")
-            .order("date", desc=True)
+            sb.table(SUMMARY_TABLE_NAME)
+            .select("trade_date")
+            .order("trade_date", desc=True)
             .limit(1)
             .execute()
         )
     except APIError as exc:
         if _is_missing_table_error(exc):
             raise FatalConfigError(
-                f"Supabase table '{TABLE_NAME}' was not found. "
-                "Check your schema and retry."
+                f"Supabase table '{SUMMARY_TABLE_NAME}' was not found. "
+                "Run the schema SQL first and retry."
             ) from exc
         raise
 
     if res.data:
-        # date is stored as timestamptz; parse just the date part
-        raw = res.data[0]["date"]
-        return date.fromisoformat(str(raw)[:10])
+        return date.fromisoformat(str(res.data[0]["trade_date"])[:10])
     return None
 
 
-def upsert_rows(sb: Client, rows: list[dict]) -> None:
-    """
-    Upsert rows into datatable.
-    Because the table has no unique constraint on (symbol, date) we use
-    INSERT … ON CONFLICT DO NOTHING via ignoreDuplicates=True, which skips
-    rows that would violate any unique/pk constraint.  If you later add a
-    unique index on (symbol, date) this will de-duplicate correctly.
-    """
-    if not rows:
-        return
+def upsert_summary(sb: Client, summary: dict) -> None:
+    """Insert or update the market-level daily summary row."""
     try:
-        sb.table(TABLE_NAME).upsert(rows).execute()
+        sb.table(SUMMARY_TABLE_NAME).upsert(
+            summary, on_conflict="trade_date"
+        ).execute()
     except APIError as exc:
         if _is_missing_table_error(exc):
             raise FatalConfigError(
-                f"Supabase table '{TABLE_NAME}' was not found. "
-                "Check your schema and retry."
+                f"Supabase table '{SUMMARY_TABLE_NAME}' was not found."
             ) from exc
         raise
+    log.info("    Upserted market summary for %s", summary["trade_date"])
 
+
+def upsert_rows(sb: Client, rows: list[dict]) -> None:
+    """Upsert ticker rows, deduplicating on (symbol, trade_date)."""
+    if not rows:
+        return
+    try:
+        sb.table(TABLE_NAME).upsert(
+            rows, on_conflict="symbol,trade_date"
+        ).execute()
+    except APIError as exc:
+        if _is_missing_table_error(exc):
+            raise FatalConfigError(
+                f"Supabase table '{TABLE_NAME}' was not found."
+            ) from exc
+        raise
     log.info("    Upserted %d rows", len(rows))
 
 
@@ -187,7 +193,7 @@ def download_pdf(d: date) -> bytes | None:
                     ct = resp.headers.get("Content-Type", "")
                     if resp.content[:4] == b"%PDF" or "pdf" in ct:
                         return resp.content
-                    log.warning("  %s -> 200 but non-PDF response from %s", d, url)
+                    log.warning("  %s -> 200 but non-PDF from %s", d, url)
                     break
                 log.warning(
                     "  %s -> HTTP %d from %s (attempt %d/%d)",
@@ -198,14 +204,10 @@ def download_pdf(d: date) -> bytes | None:
                     "  %s -> network error from %s (attempt %d/%d): %s",
                     d, url, attempt, MAX_RETRIES, exc,
                 )
-
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
 
-        # Next template URL.
-        continue
-
-    log.info("  %s -> source PDF not found for configured URL templates, skipping", d)
+    log.info("  %s -> PDF not found, skipping", d)
     return None
 
 
@@ -215,7 +217,6 @@ def download_pdf(d: date) -> bytes | None:
 
 # Matches a data row such as:
 #   LUCK Lucky Cement 2920671 435.77 439.99 444 430.15 435.5 -0.27
-#   KEL  K-Electric Ltd. 53102169 7.77 7.86 7.97 7.78 7.81 0.04
 _ROW_RE = re.compile(
     r"^([A-Z][A-Z0-9]*)\s+"    # ticker  (group 1)
     r"(.+?)\s+"                 # company name, lazy  (group 2)
@@ -230,6 +231,22 @@ _ROW_RE = re.compile(
 
 # Section header:  ***COMMERCIAL BANKS***
 _SECTION_RE = re.compile(r"\*{3}\s*(.+?)\s*\*{3}")
+
+# PDF header line examples:
+#   P. Vol.: 229930650  P.KSE100 Ind: 43740.49  P.KSE 30 Ind: 22059.24  Plus : 170
+#   C. Vol.: 137042470  C.KSE100 Ind: 43829.08  C.KSE 30 Ind: 22090.54  Minus: 172
+#   Total      359  Net Change: 88.59   Net Change: 31.30   Equal: 17
+#   Flu No: 045/2018
+_PVOL_RE   = re.compile(r"P\.\s*Vol\.:\s*([\d,]+)")
+_CVOL_RE   = re.compile(r"C\.\s*Vol\.:\s*([\d,]+)")
+_PKSE100_RE = re.compile(r"P\.KSE100\s+Ind:\s*([\d.]+)")
+_CKSE100_RE = re.compile(r"C\.KSE100\s+Ind:\s*([\d.]+)")
+_PKSE30_RE  = re.compile(r"P\.KSE\s*30\s+Ind:\s*([\d.]+)")
+_CKSE30_RE  = re.compile(r"C\.KSE\s*30\s+Ind:\s*([\d.]+)")
+_PLUS_RE    = re.compile(r"Plus\s*:\s*(\d+)")
+_MINUS_RE   = re.compile(r"Minus\s*:\s*(\d+)")
+_EQUAL_RE   = re.compile(r"Equal\s*:\s*(\d+)")
+_FLUNO_RE   = re.compile(r"Flu\s+No[:\s]+([\w/]+)")
 
 
 def _to_float(s: str) -> float | None:
@@ -250,22 +267,59 @@ def _to_int(s: str) -> int | None:
         return None
 
 
-def parse_pdf(pdf_bytes: bytes, trade_date: date) -> list[dict]:
+def _extract_header(full_text: str) -> dict:
+    """Parse the market-level summary fields from the first page text."""
+
+    def _find(pattern: re.Pattern) -> str | None:
+        m = pattern.search(full_text)
+        return m.group(1).replace(",", "") if m else None
+
+    return {
+        "prev_volume":    _to_int(_find(_PVOL_RE)),
+        "curr_volume":    _to_int(_find(_CVOL_RE)),
+        "kse100_prev":    _to_float(_find(_PKSE100_RE)),
+        "kse100_close":   _to_float(_find(_CKSE100_RE)),
+        "kse100_change":  round(
+            (_to_float(_find(_CKSE100_RE)) or 0)
+            - (_to_float(_find(_PKSE100_RE)) or 0),
+            2,
+        ),
+        "kse30_prev":     _to_float(_find(_PKSE30_RE)),
+        "kse30_close":    _to_float(_find(_CKSE30_RE)),
+        "kse30_change":   round(
+            (_to_float(_find(_CKSE30_RE)) or 0)
+            - (_to_float(_find(_PKSE30_RE)) or 0),
+            2,
+        ),
+        "advances":       _to_int(_find(_PLUS_RE)),
+        "declines":       _to_int(_find(_MINUS_RE)),
+        "unchanged":      _to_int(_find(_EQUAL_RE)),
+        "flu_no":         _find(_FLUNO_RE),
+    }
+
+
+def parse_pdf(pdf_bytes: bytes, trade_date: date) -> tuple[dict, list[dict]]:
     """
     Parse all pages of the PDF.
-    Returns a list of row dicts shaped for the `datatable` Supabase table:
-      date, symbol, company, open, high, low, close, turnover, change
+
+    Returns:
+        summary  – dict shaped for market_daily_summary
+        rows     – list of dicts shaped for datatable
     """
     rows: list[dict] = []
     current_section = "UNKNOWN"
     skip_section    = False
+    full_first_page = ""
 
-    # Use midnight UTC as the timestamptz value for the trade date
-    trade_ts = f"{trade_date.isoformat()}T00:00:00+00:00"
+    trade_date_str = trade_date.isoformat()   # plain date string: "2018-03-05"
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+
+            if page_idx == 0:
+                full_first_page = text
+
             for raw_line in text.splitlines():
                 line = raw_line.strip()
                 if not line:
@@ -294,18 +348,22 @@ def parse_pdf(pdf_bytes: bytes, trade_date: date) -> list[dict]:
                 ) = m.groups()
 
                 rows.append({
-                    "date":     trade_ts,
-                    "symbol":   ticker,
-                    "company":  name.strip(),
-                    "open":     _to_float(open_r),
-                    "high":     _to_float(high),
-                    "low":      _to_float(low),
-                    "close":    _to_float(close),
-                    "turnover": _to_int(turnover),
-                    "change":   _to_float(diff),
+                    "trade_date": trade_date_str,
+                    "symbol":     ticker,
+                    "company":    name.strip(),
+                    "open":       _to_float(open_r),
+                    "high":       _to_float(high),
+                    "low":        _to_float(low),
+                    "close":      _to_float(close),
+                    "turnover":   _to_int(turnover),
+                    "change":     _to_float(diff),
+                    "section":    current_section,
                 })
 
-    return rows
+    summary = _extract_header(full_first_page)
+    summary["trade_date"] = trade_date_str
+
+    return summary, rows
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -348,8 +406,11 @@ def main() -> None:
             current += timedelta(days=1)
             continue
 
-        rows = parse_pdf(pdf_bytes, current)
-        log.info("  Parsed %d rows", len(rows))
+        summary, rows = parse_pdf(pdf_bytes, current)
+        log.info("  Parsed %d ticker rows", len(rows))
+
+        # Always insert the summary first (FK parent)
+        upsert_summary(sb, summary)
 
         for i in range(0, len(rows), BATCH_SIZE):
             upsert_rows(sb, rows[i: i + BATCH_SIZE])

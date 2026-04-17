@@ -1,8 +1,0 @@
-#9: Resuming from 2018-01-06  (last stored date: 2018-01-05)
-    Done. 198 trading days stored, 102 non-trading days skipped, 66117 rows written.
-    Stopped at 2018-11-01 due to MAX_DAYS_PER_RUN=300. Remaining dates will be picked up by the next run.
-#10: Done. 201 trading days stored, 99 non-trading days skipped, 60586 rows written.
-    Stopped at 2019-08-28 due to MAX_DAYS_PER_RUN=300. Remaining dates will be picked up by the next run.
-#11:  Done. 204 trading days stored, 96 non-trading days skipped, 65371 rows written.
-    Stopped at 2020-06-23 due to MAX_DAYS_PER_RUN=300. Remaining dates will be picked up by the next run.
-
