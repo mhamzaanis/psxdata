@@ -2,14 +2,15 @@ name: PSX Daily Price Sync
 
 on:
   schedule:
-    # High-frequency publish window (PKT afternoon/evening)
-    - cron: "*/20 9-14 * * 1-5"
-    # Ongoing catch-up cadence for historical backfill
-    - cron: "15 */2 * * 1-5"
+    # Every 20 min during PSX market + post-market window (PKT = UTC+5)
+    # 09:30–16:15 PKT = 04:30–11:15 UTC → run 04:00–12:00 UTC to be safe
+    - cron: "*/20 4-12 * * 1-5"
+    # Overnight catch-up pass for historical backfill (runs even on weekends)
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       start_date:
-        description: "Initial backfill date (YYYY-MM-DD)"
+        description: "Override start date for backfill (YYYY-MM-DD)"
         required: false
         default: "2015-01-01"
       max_days_per_run:
@@ -19,76 +20,94 @@ on:
 
 concurrency:
   group: psx-sync
-  cancel-in-progress: false
+  cancel-in-progress: false   # never cancel a running sync mid-flight
 
 jobs:
   sync:
-    name: Fetch and Parse PSX PDFs to Supabase
+    name: Fetch and Parse PSX PDFs → Supabase
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
     permissions:
       contents: read
 
     env:
-      # Fallbacks handle common naming mismatches in repository settings.
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL || secrets.SUPABASE_UR || vars.SUPABASE_URL || vars.SUPABASE_UR }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY || secrets.SUPABASE_SERVIVE_KEY || vars.SUPABASE_SERVICE_KEY || vars.SUPABASE_SERVIVE_KEY }}
-      START_DATE: ${{ inputs.start_date || '2015-01-01' }}
-      MAX_DAYS_PER_RUN: ${{ inputs.max_days_per_run || '300' }}
-      MAX_RETRIES: "4"
-      RETRY_DELAY: "6"
-      REQUEST_DELAY: "0.8"
-      BATCH_SIZE: "300"
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      START_DATE:           ${{ inputs.start_date     || '2015-01-01' }}
+      MAX_DAYS_PER_RUN:     ${{ inputs.max_days_per_run || '300' }}
+      MAX_RETRIES:          "4"
+      RETRY_DELAY:          "6"
+      REQUEST_DELAY:        "0.8"
+      BATCH_SIZE:           "300"
 
     steps:
-      - name: Checkout
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── 2. Validate secrets are present ───────────────────────────────────
       - name: Validate required secrets
         run: |
-          test -n "$SUPABASE_URL" || (echo "SUPABASE_URL is missing" && exit 1)
-          test -n "$SUPABASE_SERVICE_KEY" || (echo "SUPABASE_SERVICE_KEY is missing" && exit 1)
+          if [ -z "$SUPABASE_URL" ]; then
+            echo "::error::Secret SUPABASE_URL is not set."
+            exit 1
+          fi
+          if [ -z "$SUPABASE_SERVICE_KEY" ]; then
+            echo "::error::Secret SUPABASE_SERVICE_KEY is not set."
+            exit 1
+          fi
+          echo "Secrets validated."
 
+      # ── 3. Python setup ───────────────────────────────────────────────────
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
+      # ── 4. Install dependencies ───────────────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run PSX sync with retries
+      # ── 5. Run sync (3 attempts with back-off) ────────────────────────────
+      - name: Run PSX sync
         shell: bash
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            echo "Run attempt $attempt/3"
-
+            echo "──────────────────────────────────────"
+            echo "Attempt $attempt / 3"
+            echo "──────────────────────────────────────"
             set +e
             python fetch.py
             status=$?
             set -e
 
             if [ "$status" -eq 0 ]; then
+              echo "Sync completed successfully."
               exit 0
             fi
 
+            # Exit code 2 = FatalConfigError (schema/auth problem) → don't retry
             if [ "$status" -eq 2 ]; then
-              echo "Non-retryable setup error. Fix configuration/schema and re-run."
-              exit "$status"
+              echo "::error::Non-retryable configuration error. Fix secrets/schema and re-run."
+              exit 2
             fi
 
             if [ "$attempt" -lt 3 ]; then
-              echo "Retrying in 30s..."
+              echo "Transient error (exit $status). Retrying in 30 s…"
               sleep 30
             fi
           done
-          echo "PSX sync failed after 3 attempts"
+
+          echo "::error::PSX sync failed after 3 attempts."
           exit 1
 
-      - name: Notify on failure
+      # ── 6. Notify on failure ──────────────────────────────────────────────
+      - name: Annotate failure
         if: failure()
-        run: echo "::error::PSX sync failed. Review workflow logs for details."
+        run: |
+          echo "::error::PSX sync workflow failed. Check the logs above for details."

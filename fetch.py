@@ -10,11 +10,11 @@ PDF URL pattern:
 
 GitHub Actions usage:
   - Set SUPABASE_URL and SUPABASE_SERVICE_KEY as repository secrets.
-    - The workflow runs frequently on weekdays; it can also be run manually.
+  - The workflow runs frequently on weekdays; it can also be run manually.
 
 Run locally:
   pip install -r requirements.txt
-    SUPABASE_URL=... SUPABASE_SERVICE_KEY=... python fetch.py
+  SUPABASE_URL=... SUPABASE_SERVICE_KEY=... python fetch.py
 """
 
 from __future__ import annotations
@@ -39,20 +39,20 @@ from supabase import create_client, Client
 SUPABASE_URL: str         = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY: str = os.environ["SUPABASE_SERVICE_KEY"]
 
-TABLE_NAME    = "psx_daily_prices"
+TABLE_NAME    = "datatable"
 START_DATE    = date.fromisoformat(os.getenv("START_DATE", "2015-01-01"))
 
 MAX_RETRIES      = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY      = float(os.getenv("RETRY_DELAY", "10"))
 REQUEST_DELAY    = float(os.getenv("REQUEST_DELAY", "1.5"))
 BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "200"))
-MAX_DAYS_PER_RUN = int(os.getenv("MAX_DAYS_PER_RUN", "0"))  # 0 = no cap
+MAX_DAYS_PER_RUN = int(os.getenv("MAX_DAYS_PER_RUN", "0"))   # 0 = no cap
 
 PDF_URL_TEMPLATE = (
     "https://dps.psx.com.pk/download/closing_rates/{day_str}.pdf"
 )
 
-# Sections to skip (futures, bonds, defaulters)
+# Sections to skip entirely
 SKIP_SECTION_KEYWORDS = {
     "FUTURE CONTRACTS",
     "STOCK INDEX FUTURE",
@@ -90,12 +90,12 @@ def get_supabase() -> Client:
 
 
 def get_last_stored_date(sb: Client) -> date | None:
-    """Return the most recent trade_date stored, or None."""
+    """Return the most recent trade date stored, or None."""
     try:
         res = (
             sb.table(TABLE_NAME)
-            .select("trade_date")
-            .order("trade_date", desc=True)
+            .select("date")
+            .order("date", desc=True)
             .limit(1)
             .execute()
         )
@@ -103,25 +103,34 @@ def get_last_stored_date(sb: Client) -> date | None:
         if _is_missing_table_error(exc):
             raise FatalConfigError(
                 f"Supabase table '{TABLE_NAME}' was not found. "
-                "Run supabaseschema.sql in your Supabase SQL Editor, then retry."
+                "Check your schema and retry."
             ) from exc
         raise
 
     if res.data:
-        return date.fromisoformat(res.data[0]["trade_date"])
+        # date is stored as timestamptz; parse just the date part
+        raw = res.data[0]["date"]
+        return date.fromisoformat(str(raw)[:10])
     return None
 
 
 def upsert_rows(sb: Client, rows: list[dict]) -> None:
+    """
+    Upsert rows into datatable.
+    Because the table has no unique constraint on (symbol, date) we use
+    INSERT … ON CONFLICT DO NOTHING via ignoreDuplicates=True, which skips
+    rows that would violate any unique/pk constraint.  If you later add a
+    unique index on (symbol, date) this will de-duplicate correctly.
+    """
     if not rows:
         return
     try:
-        sb.table(TABLE_NAME).upsert(rows, on_conflict="ticker,trade_date").execute()
+        sb.table(TABLE_NAME).upsert(rows).execute()
     except APIError as exc:
         if _is_missing_table_error(exc):
             raise FatalConfigError(
                 f"Supabase table '{TABLE_NAME}' was not found. "
-                "Run supabaseschema.sql in your Supabase SQL Editor, then retry."
+                "Check your schema and retry."
             ) from exc
         raise
 
@@ -133,14 +142,14 @@ def upsert_rows(sb: Client, rows: list[dict]) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def day_str(d: date) -> str:
-    """16APR2026"""
+    """Format date as 16APR2026."""
     return d.strftime("%d%b%Y").upper()
 
 
 def download_pdf(d: date) -> bytes | None:
     """
     Download the closing-rate PDF for date *d*.
-    Returns PDF bytes on success, None for non-trading days.
+    Returns PDF bytes on success, None for non-trading days (404 / non-PDF).
     """
     url = PDF_URL_TEMPLATE.format(day_str=day_str(d))
     for attempt in range(1, MAX_RETRIES + 1):
@@ -150,14 +159,20 @@ def download_pdf(d: date) -> bytes | None:
                 log.debug("  %s -> 404 (holiday/weekend)", d)
                 return None
             if resp.status_code == 200:
-                # PSX may return an HTML error page with 200 status
-                if resp.content[:4] == b"%PDF" or "pdf" in resp.headers.get("Content-Type", ""):
+                ct = resp.headers.get("Content-Type", "")
+                if resp.content[:4] == b"%PDF" or "pdf" in ct:
                     return resp.content
                 log.debug("  %s -> 200 but non-PDF response, skipping", d)
                 return None
-            log.warning("  %s -> HTTP %d (attempt %d/%d)", d, resp.status_code, attempt, MAX_RETRIES)
+            log.warning(
+                "  %s -> HTTP %d (attempt %d/%d)",
+                d, resp.status_code, attempt, MAX_RETRIES,
+            )
         except requests.RequestException as exc:
-            log.warning("  %s -> network error (attempt %d/%d): %s", d, attempt, MAX_RETRIES, exc)
+            log.warning(
+                "  %s -> network error (attempt %d/%d): %s",
+                d, attempt, MAX_RETRIES, exc,
+            )
 
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_DELAY)
@@ -170,26 +185,26 @@ def download_pdf(d: date) -> bytes | None:
 # PDF parsing
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Matches a data row, e.g.:
+# Matches a data row such as:
 #   LUCK Lucky Cement 2920671 435.77 439.99 444 430.15 435.5 -0.27
 #   KEL  K-Electric Ltd. 53102169 7.77 7.86 7.97 7.78 7.81 0.04
 _ROW_RE = re.compile(
-    r"^([A-Z][A-Z0-9]*)\s+"   # ticker
-    r"(.+?)\s+"                # company name (lazy, may contain spaces)
-    r"(\d[\d,]*)\s+"           # turnover
-    r"([\d.]+|-)\s+"           # prev rate
-    r"([\d.]+|-)\s+"           # open rate
-    r"([\d.]+|-)\s+"           # highest
-    r"([\d.]+|-)\s+"           # lowest
-    r"([\d.]+|-)\s+"           # last rate
-    r"(-?[\d.]+)$"             # diff (can be negative)
+    r"^([A-Z][A-Z0-9]*)\s+"    # ticker  (group 1)
+    r"(.+?)\s+"                 # company name, lazy  (group 2)
+    r"(\d[\d,]*)\s+"            # turnover  (group 3)
+    r"([\d.]+|-)\s+"            # prev rate  (group 4)
+    r"([\d.]+|-)\s+"            # open rate  (group 5)
+    r"([\d.]+|-)\s+"            # highest  (group 6)
+    r"([\d.]+|-)\s+"            # lowest  (group 7)
+    r"([\d.]+|-)\s+"            # last/close rate  (group 8)
+    r"(-?[\d.]+)$"              # diff / change  (group 9)
 )
 
-# Section header: ***COMMERCIAL BANKS***
+# Section header:  ***COMMERCIAL BANKS***
 _SECTION_RE = re.compile(r"\*{3}\s*(.+?)\s*\*{3}")
 
 
-def _float(s: str) -> float | None:
+def _to_float(s: str) -> float | None:
     if not s or s == "-":
         return None
     try:
@@ -198,7 +213,7 @@ def _float(s: str) -> float | None:
         return None
 
 
-def _int(s: str) -> int | None:
+def _to_int(s: str) -> int | None:
     if not s or s == "-":
         return None
     try:
@@ -208,10 +223,17 @@ def _int(s: str) -> int | None:
 
 
 def parse_pdf(pdf_bytes: bytes, trade_date: date) -> list[dict]:
-    """Parse all pages; return list of row dicts ready for Supabase."""
+    """
+    Parse all pages of the PDF.
+    Returns a list of row dicts shaped for the `datatable` Supabase table:
+      date, symbol, company, open, high, low, close, turnover, change
+    """
     rows: list[dict] = []
     current_section = "UNKNOWN"
     skip_section    = False
+
+    # Use midnight UTC as the timestamptz value for the trade date
+    trade_ts = f"{trade_date.isoformat()}T00:00:00+00:00"
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -221,36 +243,38 @@ def parse_pdf(pdf_bytes: bytes, trade_date: date) -> list[dict]:
                 if not line:
                     continue
 
-                # Detect section header
+                # ── Detect section header ──────────────────────────────────
                 m_sec = _SECTION_RE.search(line)
                 if m_sec:
                     current_section = m_sec.group(1).strip().upper()
-                    skip_section = any(kw in current_section for kw in SKIP_SECTION_KEYWORDS)
+                    skip_section = any(
+                        kw in current_section for kw in SKIP_SECTION_KEYWORDS
+                    )
                     continue
 
                 if skip_section:
                     continue
 
-                # Try to parse a data row
+                # ── Try to parse a data row ────────────────────────────────
                 m = _ROW_RE.match(line)
                 if not m:
                     continue
 
-                (ticker, name, turnover,
-                 prev_rate, open_rate, high, low, last, diff) = m.groups()
+                (
+                    ticker, name, turnover,
+                    _prev, open_r, high, low, close, diff,
+                ) = m.groups()
 
                 rows.append({
-                    "ticker":       ticker,
-                    "company_name": name.strip(),
-                    "sector":       current_section,
-                    "trade_date":   trade_date.isoformat(),
-                    "turnover":     _int(turnover),
-                    "prev_rate":    _float(prev_rate),
-                    "open_rate":    _float(open_rate),
-                    "high":         _float(high),
-                    "low":          _float(low),
-                    "close":        _float(last),
-                    "change":       _float(diff),
+                    "date":     trade_ts,
+                    "symbol":   ticker,
+                    "company":  name.strip(),
+                    "open":     _to_float(open_r),
+                    "high":     _to_float(high),
+                    "low":      _to_float(low),
+                    "close":    _to_float(close),
+                    "turnover": _to_int(turnover),
+                    "change":   _to_float(diff),
                 })
 
     return rows
@@ -291,7 +315,6 @@ def main() -> None:
 
         pdf_bytes = download_pdf(current)
         if pdf_bytes is None:
-            # Weekend, holiday or future date
             skipped_days += 1
             current += timedelta(days=1)
             continue
@@ -300,7 +323,7 @@ def main() -> None:
         log.info("  Parsed %d rows", len(rows))
 
         for i in range(0, len(rows), BATCH_SIZE):
-            upsert_rows(sb, rows[i : i + BATCH_SIZE])
+            upsert_rows(sb, rows[i: i + BATCH_SIZE])
 
         trading_days += 1
         current += timedelta(days=1)
@@ -313,9 +336,9 @@ def main() -> None:
 
     if end_date < today:
         log.info(
-            "Stopped at %s due to MAX_DAYS_PER_RUN=%d. Remaining dates will be picked up by the next run.",
-            end_date,
-            MAX_DAYS_PER_RUN,
+            "Stopped at %s due to MAX_DAYS_PER_RUN=%d. "
+            "Remaining dates will be picked up by the next run.",
+            end_date, MAX_DAYS_PER_RUN,
         )
 
 
