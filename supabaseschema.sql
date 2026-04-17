@@ -1,35 +1,33 @@
--- Run once in your Supabase SQL editor
--- Stores every equity/fund row from the PSX Closing Rate Summary PDF
+-- Run once in your Supabase SQL editor.
+-- This schema matches fetch.py exactly (table: datatable).
 
-create table if not exists psx_daily_prices (
-    id            bigserial primary key,
-    ticker        text          not null,
-    company_name  text,
-    sector        text,                        -- e.g. COMMERCIAL BANKS, CEMENT
-    trade_date    date          not null,
-    turnover      bigint,
-    prev_rate     numeric(18,4),
-    open_rate     numeric(18,4),
-    high          numeric(18,4),
-    low           numeric(18,4),
-    close         numeric(18,4),
-    change        numeric(18,4),
-    created_at    timestamptz   default now(),
+create table if not exists datatable (
+    id         bigserial primary key,
+    date       timestamptz not null,
+    symbol     text not null,
+    company    text,
+    open       numeric(18,4),
+    high       numeric(18,4),
+    low        numeric(18,4),
+    close      numeric(18,4),
+    turnover   bigint,
+    change     numeric(18,4),
+    created_at timestamptz default now(),
 
-    unique (ticker, trade_date)
+    unique (symbol, date)
 );
 
--- Fast lookups by ticker and date
-create index if not exists idx_psx_ticker_date
-    on psx_daily_prices (ticker, trade_date desc);
+-- Useful query indexes.
+create index if not exists idx_datatable_symbol_date
+    on datatable (symbol, date desc);
 
--- Fast lookups by sector
-create index if not exists idx_psx_sector_date
-    on psx_daily_prices (sector, trade_date desc);
+create index if not exists idx_datatable_date
+    on datatable (date desc);
 
--- Row Level Security (service role has full access)
-alter table psx_daily_prices enable row level security;
+-- Service role bypasses RLS in Supabase, but this keeps explicit policy intent.
+alter table datatable enable row level security;
 
 create policy "service role full access"
-    on psx_daily_prices for all
-    using (auth.role() = 'service_role');
+    on datatable for all
+    using (auth.role() = 'service_role')
+    with check (auth.role() = 'service_role');

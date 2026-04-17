@@ -4,9 +4,12 @@ Pakistan Stock Exchange (PSX) - PDF Closing Rate Parser & Supabase Uploader
 Downloads the official PSX "Closing Rate Summary" PDF for each trading day,
 parses every equity/fund/bond row, and upserts the data into Supabase.
 
-PDF URL pattern:
-  https://dps.psx.com.pk/download/closing_rates/{DDMMMYYYY}.pdf
-  e.g.  https://dps.psx.com.pk/download/closing_rates/16APR2026.pdf
+PDF URL pattern (currently active):
+    https://dps.psx.com.pk/download/closing_rates/{YYYY-MM-DD}.pdf
+    e.g.  https://dps.psx.com.pk/download/closing_rates/2026-04-16.pdf
+
+Backward compatibility:
+    The script also tries the older DDMMMYYYY format automatically.
 
 GitHub Actions usage:
   - Set SUPABASE_URL and SUPABASE_SERVICE_KEY as repository secrets.
@@ -48,9 +51,22 @@ REQUEST_DELAY    = float(os.getenv("REQUEST_DELAY", "1.5"))
 BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "200"))
 MAX_DAYS_PER_RUN = int(os.getenv("MAX_DAYS_PER_RUN", "0"))   # 0 = no cap
 
-PDF_URL_TEMPLATE = (
+_DEFAULT_PDF_URL_TEMPLATES = (
+    "https://dps.psx.com.pk/download/closing_rates/{day_iso}.pdf,"
     "https://dps.psx.com.pk/download/closing_rates/{day_str}.pdf"
 )
+PDF_URL_TEMPLATES = [
+    t.strip()
+    for t in os.getenv("PDF_URL_TEMPLATES", _DEFAULT_PDF_URL_TEMPLATES).split(",")
+    if t.strip()
+]
+
+# Fail the run if no rows are stored; this prevents silent "successful" no-op runs.
+FAIL_ON_EMPTY_RUN = os.getenv("FAIL_ON_EMPTY_RUN", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 # Sections to skip entirely
 SKIP_SECTION_KEYWORDS = {
@@ -146,38 +162,50 @@ def day_str(d: date) -> str:
     return d.strftime("%d%b%Y").upper()
 
 
+def day_iso(d: date) -> str:
+    """Format date as 2026-04-16."""
+    return d.isoformat()
+
+
 def download_pdf(d: date) -> bytes | None:
     """
     Download the closing-rate PDF for date *d*.
     Returns PDF bytes on success, None for non-trading days (404 / non-PDF).
     """
-    url = PDF_URL_TEMPLATE.format(day_str=day_str(d))
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.get(url, timeout=30)
-            if resp.status_code == 404:
-                log.debug("  %s -> 404 (holiday/weekend)", d)
-                return None
-            if resp.status_code == 200:
-                ct = resp.headers.get("Content-Type", "")
-                if resp.content[:4] == b"%PDF" or "pdf" in ct:
-                    return resp.content
-                log.debug("  %s -> 200 but non-PDF response, skipping", d)
-                return None
-            log.warning(
-                "  %s -> HTTP %d (attempt %d/%d)",
-                d, resp.status_code, attempt, MAX_RETRIES,
-            )
-        except requests.RequestException as exc:
-            log.warning(
-                "  %s -> network error (attempt %d/%d): %s",
-                d, attempt, MAX_RETRIES, exc,
-            )
+    urls = [
+        template.format(day_str=day_str(d), day_iso=day_iso(d))
+        for template in PDF_URL_TEMPLATES
+    ]
 
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY)
+    for url in urls:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.get(url, timeout=30)
+                if resp.status_code == 404:
+                    break
+                if resp.status_code == 200:
+                    ct = resp.headers.get("Content-Type", "")
+                    if resp.content[:4] == b"%PDF" or "pdf" in ct:
+                        return resp.content
+                    log.warning("  %s -> 200 but non-PDF response from %s", d, url)
+                    break
+                log.warning(
+                    "  %s -> HTTP %d from %s (attempt %d/%d)",
+                    d, resp.status_code, url, attempt, MAX_RETRIES,
+                )
+            except requests.RequestException as exc:
+                log.warning(
+                    "  %s -> network error from %s (attempt %d/%d): %s",
+                    d, url, attempt, MAX_RETRIES, exc,
+                )
 
-    log.warning("  %s -> all %d attempts failed, skipping.", d, MAX_RETRIES)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
+        # Next template URL.
+        continue
+
+    log.info("  %s -> source PDF not found for configured URL templates, skipping", d)
     return None
 
 
@@ -308,6 +336,7 @@ def main() -> None:
     log.info("Processing range %s -> %s", fetch_from, end_date)
 
     trading_days = skipped_days = 0
+    total_rows_stored = 0
     current = fetch_from
 
     while current <= end_date:
@@ -324,15 +353,22 @@ def main() -> None:
 
         for i in range(0, len(rows), BATCH_SIZE):
             upsert_rows(sb, rows[i: i + BATCH_SIZE])
+        total_rows_stored += len(rows)
 
         trading_days += 1
         current += timedelta(days=1)
         time.sleep(REQUEST_DELAY)
 
     log.info(
-        "Done. %d trading days stored, %d non-trading days skipped.",
-        trading_days, skipped_days,
+        "Done. %d trading days stored, %d non-trading days skipped, %d rows written.",
+        trading_days, skipped_days, total_rows_stored,
     )
+
+    if FAIL_ON_EMPTY_RUN and total_rows_stored == 0:
+        raise RuntimeError(
+            "No rows were written in this run. Most common cause: the configured "
+            "PDF_URL_TEMPLATES value does not match the current PSX download endpoint."
+        )
 
     if end_date < today:
         log.info(
