@@ -12,7 +12,7 @@ on:
       start_date:
         description: "Override start date for backfill (YYYY-MM-DD)"
         required: false
-        default: "2015-01-01"
+        default: "2018-01-01"
       max_days_per_run:
         description: "Max calendar days to process per run (0 = no cap)"
         required: false
@@ -34,7 +34,7 @@ jobs:
     env:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      START_DATE:           ${{ inputs.start_date     || '2015-01-01' }}
+      START_DATE:           ${{ inputs.start_date     || '2018-01-01' }}
       MAX_DAYS_PER_RUN:     ${{ inputs.max_days_per_run || '300' }}
       MAX_RETRIES:          "4"
       RETRY_DELAY:          "6"
